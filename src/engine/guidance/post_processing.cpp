@@ -1,9 +1,11 @@
-#include "extractor/guidance/turn_instruction.hpp"
 #include "engine/guidance/post_processing.hpp"
+#include "extractor/guidance/turn_instruction.hpp"
 
 #include "engine/guidance/assemble_steps.hpp"
+#include "engine/guidance/lane_processing.hpp"
 #include "engine/guidance/toolkit.hpp"
 
+#include "util/debug.hpp"
 #include "util/guidance/toolkit.hpp"
 #include "util/guidance/turn_lanes.hpp"
 
@@ -497,11 +499,69 @@ void collapseTurnAt(std::vector<RouteStep> &steps,
     }
 }
 
+// Works on steps including silent and invalid instructions in order to do lane anticipation for
+// roundabouts which later on get collapsed into a single multi-hop instruction.
+std::vector<RouteStep> anticipateLaneChangeForRoundabouts(std::vector<RouteStep> steps)
+{
+    const constexpr auto MIN_DURATION_NEEDED_FOR_LANE_CHANGE_INSIDE_ROUNDABOUT = 15.;
+
+    // Walk over all steps, find enter / leave roundabout pairs
+    for (auto it = begin(steps), last = end(steps); it != last;)
+    {
+        auto enter = std::find_if(it, last, [](const RouteStep &step) {
+            return entersRoundabout(step.maneuver.instruction);
+        });
+
+        auto leave = std::find_if(it, last, [](const RouteStep &step) {
+            return leavesRoundabout(step.maneuver.instruction);
+        });
+
+        // No roundabouts, or partial one (like start / end inside a roundabout)
+        if (enter == last || leave == last)
+            break;
+
+        // This is the first step after a roundabout's enter / leave pair
+        const auto skip_leave = leave + 1;
+
+        // enter has to come before leave, otherwise: faulty data / partial roundabout, skip those
+        if (leave < enter)
+        {
+            it = skip_leave;
+            continue;
+        }
+
+        // We only care about roundabouts where there is no time to change lanes inside
+        const auto seconds_inside_roundabout =
+            std::accumulate(enter, skip_leave, 0., [](const double acc, const RouteStep &step) {
+                return acc + step.duration;
+            });
+
+        if (seconds_inside_roundabout >= MIN_DURATION_NEEDED_FOR_LANE_CHANGE_INSIDE_ROUNDABOUT)
+        {
+            it = skip_leave;
+            continue;
+        }
+
+        // This what we know so far:
+        // - there is a valid roundabout, indicated by the iterator range: enter, leave
+        // - the roundabout is short enough requiring lane anticipation
+        // We now do lane anticipation on the roundabout's enter and leave step only.
+        // TODO: This means, lanes _inside_ the roundabout are ignored at the moment.
+
+        auto enterAndLeave = anticipateLaneChange({*enter, *leave});
+        std::swap(*enter, enterAndLeave[0]);
+        std::swap(*leave, enterAndLeave[1]);
+
+        // Skip over currently handled enter / leave roundabout pair
+        it = skip_leave;
+    }
+
+    return steps;
+}
 } // namespace
 
 // Post processing can invalidate some instructions. For example StayOnRoundabout
 // is turned into exit counts. These instructions are removed by the following function
-
 std::vector<RouteStep> removeNoTurnInstructions(std::vector<RouteStep> steps)
 {
     // finally clean up the post-processed instructions.
@@ -516,6 +576,9 @@ std::vector<RouteStep> removeNoTurnInstructions(std::vector<RouteStep> steps)
     };
 
     boost::remove_erase_if(steps, not_is_valid);
+
+    // the steps should still include depart and arrive at least
+    BOOST_ASSERT(steps.size() >= 2);
 
     BOOST_ASSERT(steps.front().intersections.size() >= 1);
     BOOST_ASSERT(steps.front().intersections.front().bearings.size() == 1);
@@ -543,6 +606,11 @@ std::vector<RouteStep> postProcess(std::vector<RouteStep> steps)
     if (steps.size() == 2)
         return steps;
 
+    // Before we invalidate and remove silent instructions, we handle roundabouts (before they're
+    // getting collapsed into a single multi-hop instruction) by back-propagating exit lane
+    // constraints already to a roundabout's enter instruction.
+    steps = anticipateLaneChangeForRoundabouts(std::move(steps));
+
     // Count Street Exits forward
     bool on_roundabout = false;
     bool has_entered_roundabout = false;
@@ -550,7 +618,7 @@ std::vector<RouteStep> postProcess(std::vector<RouteStep> steps)
     // count the exits forward. if enter/exit roundabout happen both, no further treatment is
     // required. We might end up with only one of them (e.g. starting within a roundabout)
     // or having a via-point in the roundabout.
-    // In this case, exits are numbered from the start of the lag.
+    // In this case, exits are numbered from the start of the leg.
     for (std::size_t step_index = 0; step_index < steps.size(); ++step_index)
     {
         auto &step = steps[step_index];
